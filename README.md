@@ -81,8 +81,9 @@ fprintd-verify
 
 Do **not** run `omarchy-setup-security-fingerprint` after installing this package.
 It calls `omarchy-pkg-add libfprint`, which tries to reinstall the stock package
-and aborts on the conflict. Enroll with `fprintd-enroll` directly and configure
-PAM by hand, mirroring what that script does:
+and aborts on the conflict. Enroll with `fprintd-enroll` directly, check with
+`fprintd-verify`, then run `sudo ./setup-pam.sh`, which applies the same PAM
+configuration that script would:
 
 * `/etc/pam.d/sudo` and `/etc/pam.d/polkit-1`: at the top, add
   ```
