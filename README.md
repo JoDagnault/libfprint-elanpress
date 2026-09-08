@@ -30,9 +30,35 @@ commit `34fc394`, also on the AUR as `libfprint-elanpress-git`). It treats the
 sensor as a press sensor and does match-on-host with normalized cross-correlation
 of stored touch images, the same approach the Windows driver uses.
 
-This repository carries that single commit as a patch on top of the exact
-upstream tag Arch ships, rebased from v1.94.10 to v1.94.100, so the code is
-pinned and the build follows Arch's libfprint rather than a third-party branch.
+This repository carries that commit as a patch on top of the exact upstream
+tag Arch ships, rebased from v1.94.10 to v1.94.100, plus a second patch with
+the fixes needed on the Vivobook M7400QC (see below), so the code is pinned
+and the build follows Arch's libfprint rather than a third-party branch.
+
+## What the second patch changes (0002)
+
+The driver as published did not work on this laptop's sensor (firmware 0x0500):
+
+* **Enrollment hung.** This firmware never answers the "finger present?" query
+  while no finger is on the sensor; the read blocks until a touch, then answers
+  "present" on every query. The driver waited for a "not present" byte that
+  never comes. A timed-out query is now treated as "no finger", and the query
+  is re-issued every 500 ms while waiting.
+* **Another finger matched.** The correlation was dominated by the contact
+  pressure envelope, so any two fingers scored 0.7-0.9. Images are now
+  high-pass filtered and locally contrast-normalised before correlating, the
+  sharpest frame of a touch is used (a heavy press drives the sensor into
+  compression within a few hundred ms), and the threshold is 0.60. On 21
+  genuine and 26 impostor presses over four sessions, impostors stayed at or
+  below 0.52 (worst case: the other index finger) and genuine presses on an
+  enrolled region scored 0.67-0.86.
+* **Coverage.** The sensor images about 7.5 x 2.6 mm, so a press only verifies
+  where it overlaps a stored touch. Enrollment takes 16 touches and rejects a
+  touch too similar to one already stored, asking you to move the finger.
+
+Enrollment tip: move the finger between touches (centre, left, right, tip,
+lower, rolled slightly). A press on a part of the finger you never enrolled
+will be rejected; pam_fprintd allows retries, or re-enroll with more variety.
 
 ## Build and install
 
@@ -47,7 +73,7 @@ Then:
 ```sh
 systemctl restart fprintd      # or just wait, it exits when idle
 fprintd-list "$USER"           # should say "ElanTech press-type fingerprint sensor"
-fprintd-enroll                 # 8 press-and-lift touches, do not swipe
+fprintd-enroll                 # 16 press-and-lift touches, move the finger around, do not swipe
 fprintd-verify
 ```
 
@@ -80,9 +106,10 @@ PAM by hand, mirroring what that script does:
    git clone --depth 1 --branch v<ver> https://gitlab.freedesktop.org/libfprint/libfprint.git /tmp/lf
    git -C /tmp/lf apply --check ../0001-elanpress-*.patch
    ```
-   If it fails, apply it by hand (`git am -3`), fix the conflicts, and export a
-   fresh patch with `git format-patch -1 --no-signature`. The patch only adds
-   four files and touches three lines: the `0x0c6e` entry in
+   (check both patches, in order). If one fails, apply them by hand
+   (`git am -3`), fix the conflicts, and export fresh patches with
+   `git format-patch -2 --no-signature`. Outside the four new driver files the
+   patches only touch three lines: the `0x0c6e` entry in
    `libfprint/drivers/elan.h`, `driver_sources` in `libfprint/meson.build`, and
    `drivers_info` in `meson.build`.
 4. Refresh the checksum: `updpkgsums` (from `pacman-contrib`), then
@@ -95,9 +122,10 @@ PAM by hand, mirroring what that script does:
   USB API; it has no file, network or process access. It was reviewed line by
   line before being packaged here. The base commit is byte-identical to the
   upstream tag.
-* Matching is image correlation with a fixed threshold (0.55). The author
-  validated it on their own captures only, so the false-accept rate is unknown.
-  If fingerprint is `sufficient` in PAM, a false accept
+* Matching is image correlation with a fixed threshold (0.60), validated on
+  one person's fingers (three fingers, four sessions, 47 presses). That is far
+  from a proper biometric evaluation; the false-accept rate against other
+  people is unknown. If fingerprint is `sufficient` in PAM, a false accept
   grants access; keep the password as the fallback and treat this as
   convenience-grade authentication.
 * Enrolled prints are stored as processed images in `/var/lib/fprint`

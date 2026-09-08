@@ -1,0 +1,882 @@
+From 1ccfadabbd778727a62abdea1693df19b99c7c45 Mon Sep 17 00:00:00 2001
+From: Jo Dagnault <jdagnault@gmail.com>
+Date: Tue, 8 Sep 2026 16:20:46 -0400
+Subject: [PATCH 2/2] elanpress: Handle blocking finger queries and sharpen
+ matching
+
+Tested on an ASUS Vivobook M7400QC (04f3:0c6e, bcdDevice 5.00, sensor
+FW 0x0500), where the driver as first written could not enroll and,
+once it could, accepted a different finger of the same person.
+
+Capture:
+
+* This firmware never answers the finger-status query (0x40 0x3f) while
+  no finger is on the sensor; the read simply blocks until a touch
+  arrives, and then answers 0x55 on every query. The driver waited for
+  a non-0x55 "finger off" byte that never came and spun forever. Treat
+  a timed-out status read as "no finger" so both firmware flavours work,
+  and re-issue the query every 500 ms while waiting for a touch instead
+  of one open-ended read.
+* Send the stop command (with a short settle, see MR !647) before each
+  capture, as the elan driver does between captures.
+* Log the firmware version at open and the sensor's calibration mean and
+  status after the background frame, and dump raw frames to
+  $ELANPRESS_DUMP_DIR when set, for offline analysis.
+
+Matching:
+
+* The sensor's response compresses towards a ceiling around 8900 counts
+  as the finger settles, so a heavy or moist press loses ridge contrast
+  within 100-300 ms. Use the frame with the most ridge-band energy
+  instead of averaging the middle of the touch. (Calibrating the sensor
+  with the finger on only shifts a global offset; it does not recover
+  the contrast.)
+* The contact-pressure envelope dominated the correlation, so any two
+  fingers correlated at 0.7-0.9. High-pass the image (sigma 1.5) and
+  normalise local contrast before correlating; store the result as int8.
+  Print format version 2, old prints are rejected.
+* With the new representation, on 21 genuine and 26 impostor presses
+  across four sessions (including the mirror-similar other index
+  finger), impostors stay <= 0.52 and genuine presses on an enrolled
+  region score 0.67-0.86; threshold 0.60.
+
+Enrollment:
+
+* The sensor sees about 7.5x2.6 mm, so verification only works where a
+  stored touch overlaps the probe. Enroll 16 touches instead of 8 and
+  reject a touch whose similarity to a stored one exceeds 0.75 with a
+  retry, so the user is made to move the finger between touches.
+* Reject touches with almost no ridge structure (high-pass RMS < 30).
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ libfprint/drivers/elanpress-match.c | 194 +++++++++++++----------
+ libfprint/drivers/elanpress-match.h |  50 ++++--
+ libfprint/drivers/elanpress.c       | 231 +++++++++++++++++++++++++---
+ libfprint/drivers/elanpress.h       |  17 +-
+ 4 files changed, 372 insertions(+), 120 deletions(-)
+
+diff --git a/libfprint/drivers/elanpress-match.c b/libfprint/drivers/elanpress-match.c
+index 271c388..853dc43 100644
+--- a/libfprint/drivers/elanpress-match.c
++++ b/libfprint/drivers/elanpress-match.c
+@@ -1,11 +1,11 @@
+ /*
+  * Image processing and correlation matching for ELAN press-type sensors
+  * Copyright (C) 2026 Filip Spanne
++ * Copyright (C) 2026 Jo Dagnault
+  *
+  * The imaged area of these sensors is far too small for reliable minutiae
+- * matching, so prints store the enrolled images themselves and matching is
+- * done by zero-mean normalized cross-correlation over translations, like
+- * the Windows driver does.
++ * matching, so prints store processed touch images themselves and matching
++ * is done by zero-mean normalised cross-correlation over translations.
+  *
+  * This library is free software; you can redistribute it and/or
+  * modify it under the terms of the GNU Lesser General Public
+@@ -28,12 +28,6 @@
+ #include <stdlib.h>
+ #include <string.h>
+ 
+-static int
+-elanpress_cmp_short (const void *a, const void *b)
+-{
+-  return (int) (*(unsigned short *) a - *(unsigned short *) b);
+-}
+-
+ /* the wire format is column-major with frame-height-tall columns; rotate
+  * to row-major (same layout as the elan driver uses for these sensors) */
+ void
+@@ -44,104 +38,127 @@ elanpress_rotate_frame (const guint8 *raw, unsigned short *out, int w, int h)
+       out[y * w + x] = ((const guint16 *) raw)[y + x * h];
+ }
+ 
+-/* Elantech's recommended 2-step non-linear normalization of the 14-bit
+- * background-subtracted frame onto 8 bits (see the elan driver) */
++/* separable Gaussian blur with reflected borders; tmp is w*h scratch */
+ static void
+-elanpress_normalize (const unsigned short *in, guint8 *out, unsigned int size)
++gauss_blur (const float *src, float *dst, float *tmp, int w, int h, float sigma)
+ {
+-  g_autofree unsigned short *sorted = g_malloc (size * sizeof (short));
+-  unsigned short lvl0, lvl1, lvl2, lvl3;
+-  unsigned short px;
++  int r = (int) (3 * sigma);
++  float k[64];
++  float sum = 0;
+ 
+-  memcpy (sorted, in, size * sizeof (short));
+-  qsort (sorted, size, sizeof (short), elanpress_cmp_short);
+-
+-  lvl0 = sorted[0];
+-  lvl1 = sorted[size * 3 / 10];
+-  lvl2 = sorted[size * 65 / 100];
+-  lvl3 = sorted[size - 1];
+-
+-  for (unsigned int i = 0; i < size; i++)
++  g_assert (r < 32);
++  for (int i = -r; i <= r; i++)
+     {
+-      px = in[i];
+-      if (px < lvl1)
+-        px = (px - lvl0) * 99 / MAX (lvl1 - lvl0, 1);
+-      else if (px < lvl2)
+-        px = 99 + ((px - lvl1) * 56 / MAX (lvl2 - lvl1, 1));
+-      else
+-        px = 155 + MIN ((px - lvl2) * 100 / MAX (lvl3 - lvl2, 1), 100);
+-      out[i] = (guint8) px;
++      k[i + r] = expf (-(float) (i * i) / (2 * sigma * sigma));
++      sum += k[i + r];
+     }
++  for (int i = 0; i <= 2 * r; i++)
++    k[i] /= sum;
++
++  for (int y = 0; y < h; y++)
++    for (int x = 0; x < w; x++)
++      {
++        float acc = 0;
++        for (int i = -r; i <= r; i++)
++          {
++            int xx = x + i;
++            if (xx < 0) xx = -xx - 1;
++            if (xx >= w) xx = 2 * w - xx - 1;
++            acc += src[y * w + xx] * k[i + r];
++          }
++        tmp[y * w + x] = acc;
++      }
++  for (int y = 0; y < h; y++)
++    for (int x = 0; x < w; x++)
++      {
++        float acc = 0;
++        for (int i = -r; i <= r; i++)
++          {
++            int yy = y + i;
++            if (yy < 0) yy = -yy - 1;
++            if (yy >= h) yy = 2 * h - yy - 1;
++            acc += tmp[yy * w + x] * k[i + r];
++          }
++        dst[y * w + x] = acc;
++      }
+ }
+ 
+-/* average the stable frames of a touch (newest-first list), subtract the
+- * background and normalize; returns NULL if the finger wasn't properly on
+- * the sensor */
+-guint8 *
++/* Pick the frame with the most ridge-band energy (early frames for a heavy
++ * press that drives the sensor into compression, late ones for a light
++ * press), high-pass it and normalise local contrast. Returns NULL if no
++ * frame had a finger on the sensor; *ridge_rms gets the high-pass RMS of
++ * the chosen frame in sensor counts, a usable quality measure. */
++gint8 *
+ elanpress_process_frames (GSList *frames, int num_frames,
+                           const unsigned short *background,
+-                          unsigned int size)
++                          int w, int h, double *ridge_rms)
+ {
+-  g_autofree unsigned int *sum = g_malloc0 (size * sizeof (unsigned int));
+-  g_autofree unsigned short *avg = g_malloc (size * sizeof (unsigned short));
+-  guint8 *out;
+-  int skip_oldest = 0, skip_newest = 0, used = 0, i;
+-  unsigned long total = 0;
+-  GSList *l;
++  unsigned int n = w * h;
++  g_autofree float *diff = g_malloc (n * sizeof (float));
++  g_autofree float *blur = g_malloc (n * sizeof (float));
++  g_autofree float *tmp = g_malloc (n * sizeof (float));
++  g_autofree float *hp = g_malloc (n * sizeof (float));
++  g_autofree float *best = NULL;
++  double best_energy = -1;
++  gint8 *out;
+ 
+-  if (num_frames >= 6)
+-    {
+-      skip_oldest = ELANPRESS_SKIP_OLDEST;
+-      skip_newest = ELANPRESS_SKIP_NEWEST;
+-    }
+-  else if (num_frames >= 4)
+-    {
+-      skip_oldest = 1;
+-      skip_newest = 1;
+-    }
+-
+-  for (l = frames, i = 0; l; l = l->next, i++)
++  for (GSList *l = frames; l; l = l->next)
+     {
+       const unsigned short *frame = l->data;
++      double total = 0, energy = 0;
+ 
+-      if (i < skip_newest || i >= num_frames - skip_oldest)
++      for (unsigned int i = 0; i < n; i++)
++        {
++          unsigned short bg = background ? background[i] : 0;
++          diff[i] = frame[i] > bg ? frame[i] - bg : 0;
++          total += diff[i];
++        }
++      if (total == 0)
+         continue;
+-      for (unsigned int j = 0; j < size; j++)
+-        sum[j] += frame[j];
+-      used++;
++
++      gauss_blur (diff, blur, tmp, w, h, ELANPRESS_HP_SIGMA);
++      for (unsigned int i = 0; i < n; i++)
++        {
++          hp[i] = diff[i] - blur[i];
++          energy += hp[i] * hp[i];
++        }
++      energy /= n;
++      if (energy > best_energy)
++        {
++          best_energy = energy;
++          if (!best)
++            best = g_malloc (n * sizeof (float));
++          memcpy (best, hp, n * sizeof (float));
++        }
+     }
+ 
+-  if (used == 0)
++  if (!best)
+     return NULL;
++  if (ridge_rms)
++    *ridge_rms = sqrt (best_energy);
+ 
+-  for (unsigned int j = 0; j < size; j++)
++  /* local contrast normalisation: divide by the local RMS */
++  for (unsigned int i = 0; i < n; i++)
++    tmp[i] = best[i] * best[i];
++  memcpy (hp, tmp, n * sizeof (float));
++  gauss_blur (hp, blur, tmp, w, h, ELANPRESS_LN_SIGMA);
++
++  out = g_malloc (n);
++  for (unsigned int i = 0; i < n; i++)
+     {
+-      unsigned int px = sum[j] / used;
+-      unsigned short bg = background ? background[j] : 0;
+-
+-      avg[j] = px > bg ? px - bg : 0;
+-      total += avg[j];
++      float v = best[i] / (sqrtf (blur[i]) + 1e-6f) * ELANPRESS_IMG_SCALE;
++      out[i] = (gint8) CLAMP (lrintf (v), -127, 127);
+     }
+-
+-  if (total == 0)
+-    {
+-      g_debug ("touch darker than background, ignoring");
+-      return NULL;
+-    }
+-
+-  out = g_malloc (size);
+-  elanpress_normalize (avg, out, size);
+   return out;
+ }
+ 
+ static gdouble
+-elanpress_ncc_at (const guint8 *a, const guint8 *b, int w, int h,
+-                  int dx, int dy)
++ncc_at (const float *a, const float *b, int w, int h, int dx, int dy)
+ {
+   int x0 = MAX (0, dx), x1 = MIN (w, w + dx);
+   int y0 = MAX (0, dy), y1 = MIN (h, h + dy);
+   long n = (long) (x1 - x0) * (y1 - y0);
+-  gdouble sa = 0, sb = 0, ma, mb, num = 0, da = 0, db = 0;
++  double sa = 0, sb = 0, ma, mb, num = 0, da = 0, db = 0;
+ 
+   if (n < ELANPRESS_NCC_MIN_OVERLAP_PX)
+     return -1.0;
+@@ -158,8 +175,8 @@ elanpress_ncc_at (const guint8 *a, const guint8 *b, int w, int h,
+   for (int y = y0; y < y1; y++)
+     for (int x = x0; x < x1; x++)
+       {
+-        gdouble va = a[y * w + x] - ma;
+-        gdouble vb = b[(y - dy) * w + (x - dx)] - mb;
++        double va = a[y * w + x] - ma;
++        double vb = b[(y - dy) * w + (x - dx)] - mb;
+ 
+         num += va * vb;
+         da += va * va;
+@@ -172,18 +189,27 @@ elanpress_ncc_at (const guint8 *a, const guint8 *b, int w, int h,
+   return num / sqrt (da * db);
+ }
+ 
+-/* best zero-mean normalized cross-correlation over translations: coarse
++/* best zero-mean normalised cross-correlation over translations: coarse
+  * grid first, then refinement around the best hit */
+ gdouble
+-elanpress_ncc_best (const guint8 *a, const guint8 *b, int w, int h)
++elanpress_ncc_best (const gint8 *a8, const gint8 *b8, int w, int h)
+ {
++  unsigned int n = w * h;
++  g_autofree float *a = g_malloc (n * sizeof (float));
++  g_autofree float *b = g_malloc (n * sizeof (float));
+   gdouble best = -1.0, c;
+   int best_dx = 0, best_dy = 0;
+ 
++  for (unsigned int i = 0; i < n; i++)
++    {
++      a[i] = a8[i];
++      b[i] = b8[i];
++    }
++
+   for (int dy = -ELANPRESS_NCC_MAX_DY; dy <= ELANPRESS_NCC_MAX_DY; dy += 2)
+     for (int dx = -ELANPRESS_NCC_MAX_DX; dx <= ELANPRESS_NCC_MAX_DX; dx += 3)
+       {
+-        c = elanpress_ncc_at (a, b, w, h, dx, dy);
++        c = ncc_at (a, b, w, h, dx, dy);
+         if (c > best)
+           {
+             best = c;
+@@ -195,7 +221,7 @@ elanpress_ncc_best (const guint8 *a, const guint8 *b, int w, int h)
+   for (int dy = best_dy - 2; dy <= best_dy + 2; dy++)
+     for (int dx = best_dx - 3; dx <= best_dx + 3; dx++)
+       {
+-        c = elanpress_ncc_at (a, b, w, h, dx, dy);
++        c = ncc_at (a, b, w, h, dx, dy);
+         if (c > best)
+           best = c;
+       }
+diff --git a/libfprint/drivers/elanpress-match.h b/libfprint/drivers/elanpress-match.h
+index 54bc5a8..f3321dd 100644
+--- a/libfprint/drivers/elanpress-match.h
++++ b/libfprint/drivers/elanpress-match.h
+@@ -1,6 +1,7 @@
+ /*
+  * Image processing and correlation matching for ELAN press-type sensors
+  * Copyright (C) 2026 Filip Spanne
++ * Copyright (C) 2026 Jo Dagnault
+  *
+  * This library is free software; you can redistribute it and/or
+  * modify it under the terms of the GNU Lesser General Public
+@@ -21,23 +22,42 @@
+ 
+ #include <glib.h>
+ 
+-/* frames dropped at the start (finger settling) and end (possible lift)
+- * of a touch when enough frames are available */
+-#define ELANPRESS_SKIP_OLDEST 2
+-#define ELANPRESS_SKIP_NEWEST 1
++/* Processing: the sharpest frame of a touch (highest ridge-band energy) is
++ * high-pass filtered to drop the contact-pressure envelope, then locally
++ * contrast-normalised so that heavy and light presses compare alike. The
++ * result is stored as signed 8-bit samples (value * ELANPRESS_IMG_SCALE). */
++#define ELANPRESS_HP_SIGMA 1.5
++#define ELANPRESS_LN_SIGMA 4.0
++#define ELANPRESS_IMG_SCALE 40.0
+ 
+-/* matching parameters, validated against captures of the Windows driver:
+- * genuine presses of the same finger region correlate at 0.59-0.91 while
+- * impostor images stay below 0.47 */
+-#define ELANPRESS_NCC_THRESHOLD 0.55
++/* A touch whose high-pass energy (RMS, in sensor counts) is below this had
++ * no usable ridge structure (barely touching, wet smear); ask for a retry. */
++#define ELANPRESS_MIN_RIDGE_RMS 30.0
++
++/* Matching: zero-mean normalised cross-correlation over translations,
++ * coarse grid then refinement around the best hit. */
++#define ELANPRESS_NCC_THRESHOLD 0.60
+ #define ELANPRESS_NCC_MAX_DX 60
+ #define ELANPRESS_NCC_MAX_DY 20
+ #define ELANPRESS_NCC_MIN_OVERLAP_PX 1500
+ 
+-void     elanpress_rotate_frame (const guint8 *raw, unsigned short *out,
+-                                 int w, int h);
+-guint8 * elanpress_process_frames (GSList *frames, int num_frames,
+-                                   const unsigned short *background,
+-                                   unsigned int size);
+-gdouble  elanpress_ncc_best (const guint8 *a, const guint8 *b,
+-                             int w, int h);
++/* During enrollment a touch this similar to one already stored adds no
++ * coverage; the user is asked to move the finger. */
++#define ELANPRESS_DUP_THRESHOLD 0.75
++
++void    elanpress_rotate_frame (const guint8   *raw,
++                                unsigned short *out,
++                                int             w,
++                                int             h);
++
++gint8  *elanpress_process_frames (GSList               *frames,
++                                  int                   num_frames,
++                                  const unsigned short *background,
++                                  int                   w,
++                                  int                   h,
++                                  double               *ridge_rms);
++
++gdouble elanpress_ncc_best (const gint8 *a,
++                            const gint8 *b,
++                            int          w,
++                            int          h);
+diff --git a/libfprint/drivers/elanpress.c b/libfprint/drivers/elanpress.c
+index f754617..1b662f5 100644
+--- a/libfprint/drivers/elanpress.c
++++ b/libfprint/drivers/elanpress.c
+@@ -28,6 +28,9 @@ static const guint8 cmd_pre_scan[ELANPRESS_CMD_LEN] = {0x40, 0x3f};
+ static const guint8 cmd_get_image[ELANPRESS_CMD_LEN] = {0x00, 0x09};
+ static const guint8 cmd_stop[ELANPRESS_CMD_LEN] = {0x00, 0x0b};
+ static const guint8 cmd_get_sensor_dim[ELANPRESS_CMD_LEN] = {0x00, 0x0c};
++static const guint8 cmd_get_fw_ver[ELANPRESS_CMD_LEN] = {0x40, 0x19};
++static const guint8 cmd_get_calib_mean[ELANPRESS_CMD_LEN] = {0x40, 0x24};
++static const guint8 cmd_get_calib_status[ELANPRESS_CMD_LEN] = {0x40, 0x23};
+ 
+ struct _FpiDeviceElanPress
+ {
+@@ -48,6 +51,13 @@ struct _FpiDeviceElanPress
+   int             enroll_stage;
+ 
+   guint8          finger_byte;
++  guint16         fw_ver;
++  guint16         calib_mean;
++  guint8          calib_status;
++
++  /* ELANPRESS_DUMP_DIR: write raw frames here for offline analysis */
++  const char     *dump_dir;
++  int             dump_seq;
+ };
+ 
+ G_DEFINE_TYPE (FpiDeviceElanPress, fpi_device_elanpress, FP_TYPE_DEVICE);
+@@ -60,12 +70,13 @@ elanpress_frame_size (FpiDeviceElanPress *self)
+   return (unsigned int) self->frame_width * self->frame_height;
+ }
+ 
+-static guint8 *
+-elanpress_process_touch (FpiDeviceElanPress *self)
++static gint8 *
++elanpress_process_touch (FpiDeviceElanPress *self, double *ridge_rms)
+ {
+   return elanpress_process_frames (self->frames, self->num_frames,
+                                    self->background,
+-                                   elanpress_frame_size (self));
++                                   self->frame_width, self->frame_height,
++                                   ridge_rms);
+ }
+ 
+ /* === print (de)serialization === */
+@@ -137,7 +148,7 @@ elanpress_print_get_images (FpiDeviceElanPress *self, FpPrint *print)
+ }
+ 
+ static gdouble
+-elanpress_match_print (FpiDeviceElanPress *self, const guint8 *probe,
++elanpress_match_print (FpiDeviceElanPress *self, const gint8 *probe,
+                        FpPrint *print)
+ {
+   g_autoptr(GPtrArray) images = elanpress_print_get_images (self, print);
+@@ -196,11 +207,20 @@ elanpress_read (FpiSsm *ssm, FpDevice *dev, guint8 ep, gsize len,
+ /* === touch capture state machine === */
+ 
+ enum capture_states {
+-  CAPTURE_LED_ON,
++  CAPTURE_STOP,
++  CAPTURE_STOP_SETTLE,
+   CAPTURE_WAIT_OFF_SEND,
+   CAPTURE_WAIT_OFF_READ,
++  CAPTURE_WAIT_OFF_CHECK,
++  CAPTURE_RESTOP,
++  CAPTURE_RESTOP_SETTLE,
++  CAPTURE_LED_ON,
+   CAPTURE_BG_REQUEST,
+   CAPTURE_BG_READ,
++  CAPTURE_CALIB_MEAN_SEND,
++  CAPTURE_CALIB_MEAN_READ,
++  CAPTURE_CALIB_STATUS_SEND,
++  CAPTURE_CALIB_STATUS_READ,
+   CAPTURE_WAIT_ON_SEND,
+   CAPTURE_WAIT_ON_READ,
+   CAPTURE_FRAME_REQUEST,
+@@ -208,6 +228,10 @@ enum capture_states {
+   CAPTURE_NUM_STATES,
+ };
+ 
++/* Finger-status reads come in two flavours depending on the firmware:
++ * either the sensor always answers (0x55 = finger, anything else = no
++ * finger), or it only answers once a finger is present and otherwise lets
++ * the read block. Treat a timed-out read as "no finger" so both work. */
+ static void
+ elanpress_status_cb (FpiUsbTransfer *transfer, FpDevice *dev,
+                      gpointer user_data, GError *error)
+@@ -216,14 +240,38 @@ elanpress_status_cb (FpiUsbTransfer *transfer, FpDevice *dev,
+ 
+   if (error)
+     {
++      if (g_error_matches (error, G_USB_DEVICE_ERROR,
++                           G_USB_DEVICE_ERROR_TIMED_OUT))
++        {
++          fp_dbg ("finger status read timed out: no finger");
++          g_error_free (error);
++          self->finger_byte = ELANPRESS_FINGER_ABSENT;
++          fpi_ssm_next_state (transfer->ssm);
++          return;
++        }
+       fpi_ssm_mark_failed (transfer->ssm, error);
+       return;
+     }
+ 
+   self->finger_byte = transfer->buffer[0];
++  fp_dbg ("finger status 0x%02x", self->finger_byte);
+   fpi_ssm_next_state (transfer->ssm);
+ }
+ 
++static void
++elanpress_dump_frame (FpiDeviceElanPress *self, const char *kind,
++                      const unsigned short *frame)
++{
++  g_autofree char *path = NULL;
++
++  if (!self->dump_dir)
++    return;
++  path = g_strdup_printf ("%s/%04d-%s.raw", self->dump_dir, self->dump_seq++, kind);
++  if (!g_file_set_contents (path, (const char *) frame,
++                            elanpress_frame_size (self) * sizeof (short), NULL))
++    fp_warn ("could not write %s", path);
++}
++
+ static void
+ elanpress_frame_cb (FpiUsbTransfer *transfer, FpDevice *dev,
+                     gpointer user_data, GError *error)
+@@ -246,16 +294,62 @@ elanpress_frame_cb (FpiUsbTransfer *transfer, FpDevice *dev,
+       g_free (self->background);
+       self->background = frame;
+       fp_dbg ("captured background frame");
++      elanpress_dump_frame (self, "bg", frame);
+     }
+   else
+     {
+       self->frames = g_slist_prepend (self->frames, frame);
+       self->num_frames++;
++      fp_dbg ("captured touch frame %d", self->num_frames);
++      elanpress_dump_frame (self, "touch", frame);
+     }
+ 
+   fpi_ssm_next_state (transfer->ssm);
+ }
+ 
++static void
++elanpress_calib_mean_cb (FpiUsbTransfer *transfer, FpDevice *dev,
++                         gpointer user_data, GError *error)
++{
++  FpiDeviceElanPress *self = FPI_DEVICE_ELANPRESS (dev);
++  unsigned int bg_mean = 0, n = elanpress_frame_size (self);
++
++  if (error)
++    {
++      fp_warn ("calib mean read failed: %s", error->message);
++      g_error_free (error);
++      fpi_ssm_next_state (transfer->ssm);
++      return;
++    }
++  /* same byte order the elan driver uses */
++  self->calib_mean = transfer->buffer[0] * 0xff + transfer->buffer[1];
++  for (unsigned int i = 0; i < n; i++)
++    bg_mean += self->background[i];
++  bg_mean /= n;
++  fp_dbg ("calib mean %u (raw %02x %02x), background mean %u, delta %d",
++          self->calib_mean, transfer->buffer[0], transfer->buffer[1],
++          bg_mean, (int) bg_mean - (int) self->calib_mean);
++  fpi_ssm_next_state (transfer->ssm);
++}
++
++static void
++elanpress_calib_status_cb (FpiUsbTransfer *transfer, FpDevice *dev,
++                           gpointer user_data, GError *error)
++{
++  FpiDeviceElanPress *self = FPI_DEVICE_ELANPRESS (dev);
++
++  if (error)
++    {
++      fp_warn ("calib status read failed: %s", error->message);
++      g_error_free (error);
++      fpi_ssm_next_state (transfer->ssm);
++      return;
++    }
++  self->calib_status = transfer->buffer[0];
++  fp_dbg ("calib status 0x%02x", self->calib_status);
++  fpi_ssm_next_state (transfer->ssm);
++}
++
+ static void
+ capture_run_state (FpiSsm *ssm, FpDevice *dev)
+ {
+@@ -264,8 +358,16 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
+ 
+   switch (fpi_ssm_get_cur_state (ssm))
+     {
+-    case CAPTURE_LED_ON:
+-      elanpress_send_cmd (ssm, dev, cmd_led_on);
++    case CAPTURE_STOP:
++    case CAPTURE_RESTOP:
++      /* leave any pending finger wait from a previous capture; the elan
++       * driver does the same between captures to keep the sensor sane */
++      elanpress_send_cmd (ssm, dev, cmd_stop);
++      break;
++
++    case CAPTURE_STOP_SETTLE:
++    case CAPTURE_RESTOP_SETTLE:
++      fpi_ssm_next_state_delayed (ssm, ELANPRESS_STOP_SETTLE_MS);
+       break;
+ 
+     case CAPTURE_WAIT_OFF_SEND:
+@@ -274,10 +376,10 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
+ 
+     case CAPTURE_WAIT_OFF_READ:
+       elanpress_read (ssm, dev, ELANPRESS_EP_CMD_IN, 1,
+-                      ELANPRESS_CMD_TIMEOUT, elanpress_status_cb);
++                      ELANPRESS_FINGER_OFF_TIMEOUT, elanpress_status_cb);
+       break;
+ 
+-    case CAPTURE_BG_REQUEST:
++    case CAPTURE_WAIT_OFF_CHECK:
+       if (self->finger_byte == ELANPRESS_FINGER_PRESENT)
+         {
+           /* previous touch still on the sensor */
+@@ -285,9 +387,16 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
+                                          ELANPRESS_POLL_INTERVAL_MS);
+           break;
+         }
++      fpi_ssm_next_state (ssm);
++      break;
++
++    case CAPTURE_LED_ON:
++      elanpress_send_cmd (ssm, dev, cmd_led_on);
++      break;
++
++    case CAPTURE_BG_REQUEST:
+       if (self->background)
+         {
+-          fpi_device_report_finger_status (dev, FP_FINGER_STATUS_NEEDED);
+           fpi_ssm_jump_to_state (ssm, CAPTURE_WAIT_ON_SEND);
+           break;
+         }
+@@ -299,14 +408,39 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
+                       ELANPRESS_FRAME_TIMEOUT, elanpress_frame_cb);
+       break;
+ 
++    /* diagnostic: what the sensor's own calibration thinks of the background */
++    case CAPTURE_CALIB_MEAN_SEND:
++      elanpress_send_cmd (ssm, dev, cmd_get_calib_mean);
++      break;
++
++    case CAPTURE_CALIB_MEAN_READ:
++      elanpress_read (ssm, dev, ELANPRESS_EP_CMD_IN, 2,
++                      ELANPRESS_CMD_TIMEOUT, elanpress_calib_mean_cb);
++      break;
++
++    case CAPTURE_CALIB_STATUS_SEND:
++      elanpress_send_cmd (ssm, dev, cmd_get_calib_status);
++      break;
++
++    case CAPTURE_CALIB_STATUS_READ:
++      elanpress_read (ssm, dev, ELANPRESS_EP_CMD_IN, 1,
++                      ELANPRESS_CMD_TIMEOUT, elanpress_calib_status_cb);
++      break;
++
+     case CAPTURE_WAIT_ON_SEND:
+       fpi_device_report_finger_status (dev, FP_FINGER_STATUS_NEEDED);
+       elanpress_send_cmd (ssm, dev, cmd_pre_scan);
+       break;
+ 
+     case CAPTURE_WAIT_ON_READ:
++      /* before the first frame, poll for the touch with a finite timeout
++       * and re-issue the query (a single open-ended read has been seen to
++       * never complete); once frames are coming in, a silent sensor means
++       * the finger was lifted */
+       elanpress_read (ssm, dev, ELANPRESS_EP_CMD_IN, 1,
+-                      ELANPRESS_CMD_TIMEOUT, elanpress_status_cb);
++                      self->num_frames == 0 ? ELANPRESS_FINGER_ON_POLL_TIMEOUT
++                                            : ELANPRESS_FINGER_OFF_TIMEOUT,
++                      elanpress_status_cb);
+       break;
+ 
+     case CAPTURE_FRAME_REQUEST:
+@@ -315,6 +449,7 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
+           if (self->num_frames >= ELANPRESS_MIN_FRAMES)
+             {
+               /* finger lifted after enough frames: touch complete */
++              fp_dbg ("touch complete with %d frames", self->num_frames);
+               fpi_ssm_mark_completed (ssm);
+             }
+           else if (self->num_frames > 0)
+@@ -347,9 +482,14 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
+     default:
+       /* after a frame: capture more, or finish at the cap */
+       if (self->num_frames >= ELANPRESS_MAX_FRAMES)
+-        fpi_ssm_mark_completed (ssm);
++        {
++          fp_dbg ("touch complete at frame cap (%d)", self->num_frames);
++          fpi_ssm_mark_completed (ssm);
++        }
+       else
+-        fpi_ssm_jump_to_state (ssm, CAPTURE_WAIT_ON_SEND);
++        {
++          fpi_ssm_jump_to_state (ssm, CAPTURE_WAIT_ON_SEND);
++        }
+       break;
+     }
+ }
+@@ -388,7 +528,8 @@ elanpress_enroll_touch_done (FpiSsm *ssm, FpDevice *dev, GError *error)
+ {
+   FpiDeviceElanPress *self = FPI_DEVICE_ELANPRESS (dev);
+   FpPrint *print = NULL;
+-  guint8 *image;
++  gint8 *image;
++  double rms = 0, dup = -1;
+ 
+   fpi_device_report_finger_status (dev, FP_FINGER_STATUS_NONE);
+ 
+@@ -399,17 +540,39 @@ elanpress_enroll_touch_done (FpiSsm *ssm, FpDevice *dev, GError *error)
+       return;
+     }
+ 
+-  image = elanpress_process_touch (self);
++  image = elanpress_process_touch (self, &rms);
+   elanpress_reset_capture (self);
+ 
+-  if (!image)
++  if (image)
+     {
++      for (guint i = 0; i < self->enroll_images->len; i++)
++        dup = MAX (dup, elanpress_ncc_best (image, g_ptr_array_index (self->enroll_images, i),
++                                            self->frame_width, self->frame_height));
++      fp_dbg ("enroll touch: ridge rms %.0f, max similarity to stored %.2f", rms, dup);
++    }
++
++  if (!image || rms < ELANPRESS_MIN_RIDGE_RMS)
++    {
++      /* nothing usable on the sensor */
++      g_free (image);
+       fpi_device_enroll_progress (dev, self->enroll_stage, NULL,
+                                   fpi_device_retry_new (FP_DEVICE_RETRY_GENERAL));
+       elanpress_capture_touch (self, elanpress_enroll_touch_done);
+       return;
+     }
+ 
++  if (dup >= ELANPRESS_DUP_THRESHOLD)
++    {
++      /* the sensor sees only a few square millimetres: a touch this close
++       * to a stored one adds no coverage, make the user move the finger */
++      g_free (image);
++      fpi_device_enroll_progress (dev, self->enroll_stage, NULL,
++                                  fpi_device_retry_new_msg (FP_DEVICE_RETRY_CENTER_FINGER,
++                                                            "Touch too similar to a previous one, move the finger to a different spot"));
++      elanpress_capture_touch (self, elanpress_enroll_touch_done);
++      return;
++    }
++
+   g_ptr_array_add (self->enroll_images, image);
+   self->enroll_stage++;
+   fpi_device_enroll_progress (dev, self->enroll_stage, NULL, NULL);
+@@ -448,7 +611,8 @@ elanpress_match_touch_done (FpiSsm *ssm, FpDevice *dev, GError *error)
+ {
+   FpiDeviceElanPress *self = FPI_DEVICE_ELANPRESS (dev);
+   FpiDeviceAction action = fpi_device_get_current_action (dev);
+-  g_autofree guint8 *probe = NULL;
++  g_autofree gint8 *probe = NULL;
++  double rms = 0;
+ 
+   fpi_device_report_finger_status (dev, FP_FINGER_STATUS_NONE);
+   elanpress_send_stop (dev);
+@@ -462,10 +626,11 @@ elanpress_match_touch_done (FpiSsm *ssm, FpDevice *dev, GError *error)
+       return;
+     }
+ 
+-  probe = elanpress_process_touch (self);
++  probe = elanpress_process_touch (self, &rms);
+   elanpress_reset_capture (self);
++  fp_dbg ("probe touch: ridge rms %.0f", rms);
+ 
+-  if (!probe)
++  if (!probe || rms < ELANPRESS_MIN_RIDGE_RMS)
+     {
+       GError *retry = fpi_device_retry_new (FP_DEVICE_RETRY_GENERAL);
+ 
+@@ -543,11 +708,29 @@ elanpress_identify_verify (FpDevice *dev)
+ /* === open and close === */
+ 
+ enum open_states {
++  OPEN_GET_FW_SEND,
++  OPEN_GET_FW_READ,
+   OPEN_GET_DIM_SEND,
+   OPEN_GET_DIM_READ,
+   OPEN_NUM_STATES,
+ };
+ 
++static void
++elanpress_fw_cb (FpiUsbTransfer *transfer, FpDevice *dev,
++                 gpointer user_data, GError *error)
++{
++  FpiDeviceElanPress *self = FPI_DEVICE_ELANPRESS (dev);
++
++  if (error)
++    {
++      fpi_ssm_mark_failed (transfer->ssm, error);
++      return;
++    }
++  self->fw_ver = (transfer->buffer[0] << 8) | transfer->buffer[1];
++  fp_dbg ("FW version 0x%04x", self->fw_ver);
++  fpi_ssm_next_state (transfer->ssm);
++}
++
+ static void
+ elanpress_dim_cb (FpiUsbTransfer *transfer, FpDevice *dev,
+                   gpointer user_data, GError *error)
+@@ -593,6 +776,15 @@ open_run_state (FpiSsm *ssm, FpDevice *dev)
+ {
+   switch (fpi_ssm_get_cur_state (ssm))
+     {
++    case OPEN_GET_FW_SEND:
++      elanpress_send_cmd (ssm, dev, cmd_get_fw_ver);
++      break;
++
++    case OPEN_GET_FW_READ:
++      elanpress_read (ssm, dev, ELANPRESS_EP_CMD_IN, 2,
++                      ELANPRESS_CMD_TIMEOUT, elanpress_fw_cb);
++      break;
++
+     case OPEN_GET_DIM_SEND:
+       elanpress_send_cmd (ssm, dev, cmd_get_sensor_dim);
+       break;
+@@ -651,6 +843,7 @@ elanpress_cancel (FpDevice *dev)
+ static void
+ fpi_device_elanpress_init (FpiDeviceElanPress *self)
+ {
++  self->dump_dir = g_getenv ("ELANPRESS_DUMP_DIR");
+ }
+ 
+ static void
+diff --git a/libfprint/drivers/elanpress.h b/libfprint/drivers/elanpress.h
+index 992aa3e..2534979 100644
+--- a/libfprint/drivers/elanpress.h
++++ b/libfprint/drivers/elanpress.h
+@@ -41,8 +41,21 @@
+ /* interval between finger presence polls */
+ #define ELANPRESS_POLL_INTERVAL_MS 30
+ 
++/* Some firmware revisions never answer the finger-status query while no
++ * finger is on the sensor: the read simply blocks until a touch arrives.
++ * A read that times out after this many ms therefore means "no finger". */
++#define ELANPRESS_FINGER_OFF_TIMEOUT 200
++
++/* while waiting for a touch, re-issue the finger query this often */
++#define ELANPRESS_FINGER_ON_POLL_TIMEOUT 500
++
++/* After a stop command the sensor needs a moment to leave pre-scan mode
++ * before it will accept an image request (see libfprint MR !647). */
++#define ELANPRESS_STOP_SETTLE_MS 20
++
+ /* pre_scan response when a finger is on the sensor */
+ #define ELANPRESS_FINGER_PRESENT 0x55
++#define ELANPRESS_FINGER_ABSENT 0x00
+ 
+ /* frames captured per touch; the finger is static so these only serve to
+  * average out noise */
+@@ -50,10 +63,10 @@
+ #define ELANPRESS_MAX_FRAMES 10
+ 
+ /* number of touches stored during enrollment */
+-#define ELANPRESS_ENROLL_STAGES 8
++#define ELANPRESS_ENROLL_STAGES 16
+ 
+ /* version tag for the serialized print data */
+-#define ELANPRESS_PRINT_VERSION 1
++#define ELANPRESS_PRINT_VERSION 2
+ 
+ G_DECLARE_FINAL_TYPE (FpiDeviceElanPress, fpi_device_elanpress, FPI,
+                       DEVICE_ELANPRESS, FpDevice);
