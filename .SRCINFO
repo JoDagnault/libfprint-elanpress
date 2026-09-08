@@ -1,0 +1,30 @@
+pkgbase = libfprint-elanpress
+	pkgdesc = Library for fingerprint readers, with the elanpress driver for the ELAN 04f3:0c6e press sensor
+	pkgver = 1.94.100
+	pkgrel = 1
+	url = https://fprint.freedesktop.org/
+	arch = x86_64
+	groups = fprint
+	license = LGPL-2.1-or-later
+	makedepends = git
+	makedepends = glib2-devel
+	makedepends = gobject-introspection
+	makedepends = meson
+	makedepends = systemd
+	depends = libgcc
+	depends = glib2
+	depends = glibc
+	depends = libgudev
+	depends = libgusb
+	depends = openssl
+	depends = pixman
+	provides = libfprint=1.94.100
+	provides = libfprint-2.so
+	conflicts = libfprint
+	conflicts = libfprint-elanpress-git
+	source = git+https://gitlab.freedesktop.org/libfprint/libfprint.git#commit=80a4b5ec612892c5c056c48dddaa561452cf37ec
+	source = 0001-elanpress-Add-driver-for-ELAN-press-type-sensors-04f.patch
+	b2sums = SKIP
+	b2sums = 1370c148ded9b5d46fecda65067ef00c378558653f697b5495f7fe679ff9791b1d09453e5d27feb39b156492446d9389572574e9544e86d1c6211380f40f6aac
+
+pkgname = libfprint-elanpress
