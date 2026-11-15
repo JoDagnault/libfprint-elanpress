@@ -10,7 +10,7 @@
 pkgname=libfprint-elanpress
 _pkgname=libfprint
 pkgver=1.94.100
-pkgrel=2
+pkgrel=3
 pkgdesc="Library for fingerprint readers, with the elanpress driver for the ELAN 04f3:0c6e press sensor"
 url="https://fprint.freedesktop.org/"
 arch=(x86_64)
@@ -44,10 +44,12 @@ source=(
   "git+https://gitlab.freedesktop.org/libfprint/libfprint.git#commit=$_commit"
   0001-elanpress-Add-driver-for-ELAN-press-type-sensors-04f.patch
   0002-elanpress-Handle-blocking-finger-queries-and-sharpen.patch
+  0003-elanpress-Mask-noise-tolerate-rotation-enroll-natural-presses.patch
 )
 b2sums=('SKIP'
         '1370c148ded9b5d46fecda65067ef00c378558653f697b5495f7fe679ff9791b1d09453e5d27feb39b156492446d9389572574e9544e86d1c6211380f40f6aac'
-        'b6f3f29fe5e49926f2e707a9348d46c9c4fbf74b39450cf45b9622d8678d309e6f7521d9240ab33e67e4ac21f1bcf2f88e75832aae39b8146339882dc753f665')
+        'b6f3f29fe5e49926f2e707a9348d46c9c4fbf74b39450cf45b9622d8678d309e6f7521d9240ab33e67e4ac21f1bcf2f88e75832aae39b8146339882dc753f665'
+        '80bb44ee9dfd985c057823c69dd4f154997087b44f43f9d29da1bc03098a4438d85d119324a11c72f1a9e79bbe111c61f7ed7ff9c7a49c1ad57db4e8ec3edb65')
 
 prepare() {
   cd $_pkgname

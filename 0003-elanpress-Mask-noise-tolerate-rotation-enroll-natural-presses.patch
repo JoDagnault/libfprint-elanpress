@@ -1,0 +1,459 @@
+From 9510612cb6cecdd08d8ddec1b40e790e50788bb4 Mon Sep 17 00:00:00 2001
+From: Jo Dagnault <jdagnault@gmail.com>
+Date: Sat, 14 Nov 2026 21:14:58 -0500
+Subject: [PATCH] elanpress: Mask non-contact noise, tolerate rotation, enroll
+ natural presses
+
+Measured on the Vivobook M7400QC (04f3:0c6e, FW 0x0500) with 34 recorded
+presses: 12 of the enrolled right index pressed as when unlocking, 8 of it
+deliberately varied, and 14 of three other fingers including the
+mirror-similar left index. With the 0002 print and matcher only 7 of the
+12 normal presses matched, while a wrong finger reached 0.59 against the
+0.60 threshold.
+
+Causes:
+
+* Enrollment rejected touches similar to stored ones, so the stored
+  touches spread to the edges of the fingertip and the area the finger
+  naturally lands on was barely covered. Two presses on the same spot
+  correlate at 0.80-0.94; against the old enrollment the same presses
+  scored 0.40-0.78.
+* Local contrast normalisation amplifies the sensor noise where the
+  finger does not touch to the strength of real ridges. Half the stored
+  touches had large noise regions, which diluted genuine scores and gave
+  wrong fingers something to correlate with.
+* The matcher searched translations only; a press rotated by 5-10 degrees
+  lost 0.1-0.2 of its score.
+
+Changes:
+
+* Mark pixels whose local energy is mostly above the ridge band as
+  invalid (-128, a value samples never take) and leave them out of the
+  correlation. Print format version 3; old prints are rejected and the
+  finger has to be enrolled again.
+* Search rotations of the probe up to +-10 degrees (coarse 5 degree grid,
+  the two best hits refined at 2.5 degrees and every shift nearby).
+* Require 3500 valid overlapping pixels (of 7800): over smaller overlaps
+  any two fingers' ridges line up somewhere. Threshold 0.70.
+* Enroll 20 touches and keep similar ones; reject touches and probes with
+  fewer valid pixels than a match needs.
+
+Replaying the recorded presses through this code, with the other genuine
+presses as the enrolled set: 10 of 12 normal presses match (0.72-0.94),
+the best wrong finger scores 0.63 (left index). One comparison takes about
+40 ms, about 0.8 s for a verify against 20 stored touches.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ libfprint/drivers/elanpress-match.c | 246 +++++++++++++++++++++-------
+ libfprint/drivers/elanpress-match.h |  38 ++++-
+ libfprint/drivers/elanpress.c       |  17 +-
+ libfprint/drivers/elanpress.h       |   9 +-
+ 4 files changed, 238 insertions(+), 72 deletions(-)
+
+diff --git a/libfprint/drivers/elanpress-match.c b/libfprint/drivers/elanpress-match.c
+index 853dc431..7c993dba 100644
+--- a/libfprint/drivers/elanpress-match.c
++++ b/libfprint/drivers/elanpress-match.c
+@@ -149,82 +149,218 @@ elanpress_process_frames (GSList *frames, int num_frames,
+       float v = best[i] / (sqrtf (blur[i]) + 1e-6f) * ELANPRESS_IMG_SCALE;
+       out[i] = (gint8) CLAMP (lrintf (v), -127, 127);
+     }
++  elanpress_mask_noise (out, w, h);
+   return out;
+ }
+ 
++/* Mark pixels without ridge structure (no finger contact: amplified sensor
++ * noise) as ELANPRESS_PX_INVALID. Works on the processed image so that it
++ * applies to stored prints and probes alike. */
++void
++elanpress_mask_noise (gint8 *img, int w, int h)
++{
++  unsigned int n = w * h;
++  g_autofree float *x = g_malloc (n * sizeof (float));
++  g_autofree float *smooth = g_malloc (n * sizeof (float));
++  g_autofree float *hf = g_malloc (n * sizeof (float));
++  g_autofree float *e_hf = g_malloc (n * sizeof (float));
++  g_autofree float *e_all = g_malloc (n * sizeof (float));
++  g_autofree float *tmp = g_malloc (n * sizeof (float));
++
++  for (unsigned int i = 0; i < n; i++)
++    x[i] = img[i];
++  gauss_blur (x, smooth, tmp, w, h, ELANPRESS_NOISE_SIGMA);
++  for (unsigned int i = 0; i < n; i++)
++    {
++      hf[i] = (x[i] - smooth[i]) * (x[i] - smooth[i]);
++      x[i] = x[i] * x[i];
++    }
++  gauss_blur (hf, e_hf, tmp, w, h, ELANPRESS_NOISE_WINDOW_SIGMA);
++  gauss_blur (x, e_all, tmp, w, h, ELANPRESS_NOISE_WINDOW_SIGMA);
++
++  for (unsigned int i = 0; i < n; i++)
++    if (e_hf[i] >= ELANPRESS_NOISE_MAX_FRACTION * (e_all[i] + 1e-6f))
++      img[i] = ELANPRESS_PX_INVALID;
++}
++
++int
++elanpress_count_valid (const gint8 *img, int w, int h)
++{
++  int count = 0;
++
++  for (int i = 0; i < w * h; i++)
++    count += img[i] != ELANPRESS_PX_INVALID;
++  return count;
++}
++
++/* rotate about the image centre with bilinear sampling; a pixel is invalid
++ * if it falls outside the source or touches an invalid source pixel */
++static void
++rotate_image (const gint8 *src, gint8 *dst, int w, int h, double deg)
++{
++  double t = deg * G_PI / 180.0, c = cos (t), s = sin (t);
++  double cx = (w - 1) / 2.0, cy = (h - 1) / 2.0;
++
++  if (deg == 0)
++    {
++      memcpy (dst, src, w * h);
++      return;
++    }
++
++  for (int y = 0; y < h; y++)
++    for (int x = 0; x < w; x++)
++      {
++        double xs = c * (x - cx) + s * (y - cy) + cx;
++        double ys = -s * (x - cx) + c * (y - cy) + cy;
++        int x0, y0;
++        double fx, fy, v;
++        gint8 p00, p01, p10, p11;
++
++        if (xs < 0 || xs > w - 1 || ys < 0 || ys > h - 1)
++          {
++            dst[y * w + x] = ELANPRESS_PX_INVALID;
++            continue;
++          }
++        x0 = MIN ((int) xs, w - 2);
++        y0 = MIN ((int) ys, h - 2);
++        fx = xs - x0;
++        fy = ys - y0;
++        p00 = src[y0 * w + x0];
++        p01 = src[y0 * w + x0 + 1];
++        p10 = src[(y0 + 1) * w + x0];
++        p11 = src[(y0 + 1) * w + x0 + 1];
++        if (p00 == ELANPRESS_PX_INVALID || p01 == ELANPRESS_PX_INVALID ||
++            p10 == ELANPRESS_PX_INVALID || p11 == ELANPRESS_PX_INVALID)
++          {
++            dst[y * w + x] = ELANPRESS_PX_INVALID;
++            continue;
++          }
++        v = p00 * (1 - fx) * (1 - fy) + p01 * fx * (1 - fy) +
++            p10 * (1 - fx) * fy + p11 * fx * fy;
++        dst[y * w + x] = (gint8) CLAMP (lrint (v), -127, 127);
++      }
++}
++
++/* zero-mean NCC of a[y][x] against b[y - dy][x - dx], over the pixels valid
++ * in both; -1 if that overlap is too small */
+ static gdouble
+-ncc_at (const float *a, const float *b, int w, int h, int dx, int dy)
++ncc_at (const gint8 *a, const gint8 *b, int w, int h, int dx, int dy)
+ {
+   int x0 = MAX (0, dx), x1 = MIN (w, w + dx);
+   int y0 = MAX (0, dy), y1 = MIN (h, h + dy);
+-  long n = (long) (x1 - x0) * (y1 - y0);
+-  double sa = 0, sb = 0, ma, mb, num = 0, da = 0, db = 0;
++  gint64 n = 0, sa = 0, sb = 0, saa = 0, sbb = 0, sab = 0;
++  double num, da, db;
++
++  if ((x1 - x0) * (y1 - y0) < ELANPRESS_NCC_MIN_OVERLAP_PX)
++    return -1.0;
++
++  for (int y = y0; y < y1; y++)
++    {
++      const gint8 *ra = a + y * w;
++      const gint8 *rb = b + (y - dy) * w - dx;
++
++      for (int x = x0; x < x1; x++)
++        {
++          int va = ra[x], vb = rb[x];
++
++          if (va == ELANPRESS_PX_INVALID || vb == ELANPRESS_PX_INVALID)
++            continue;
++          n++;
++          sa += va;
++          sb += vb;
++          saa += va * va;
++          sbb += vb * vb;
++          sab += va * vb;
++        }
++    }
+ 
+   if (n < ELANPRESS_NCC_MIN_OVERLAP_PX)
+     return -1.0;
+ 
+-  for (int y = y0; y < y1; y++)
+-    for (int x = x0; x < x1; x++)
+-      {
+-        sa += a[y * w + x];
+-        sb += b[(y - dy) * w + (x - dx)];
+-      }
+-  ma = sa / n;
+-  mb = sb / n;
+-
+-  for (int y = y0; y < y1; y++)
+-    for (int x = x0; x < x1; x++)
+-      {
+-        double va = a[y * w + x] - ma;
+-        double vb = b[(y - dy) * w + (x - dx)] - mb;
+-
+-        num += va * vb;
+-        da += va * va;
+-        db += vb * vb;
+-      }
+-
++  num = sab - (double) sa * sb / n;
++  da = saa - (double) sa * sa / n;
++  db = sbb - (double) sb * sb / n;
+   if (da <= 0 || db <= 0)
+     return -1.0;
+ 
+   return num / sqrt (da * db);
+ }
+ 
+-/* best zero-mean normalised cross-correlation over translations: coarse
+- * grid first, then refinement around the best hit */
+-gdouble
+-elanpress_ncc_best (const gint8 *a8, const gint8 *b8, int w, int h)
++typedef struct
+ {
+-  unsigned int n = w * h;
+-  g_autofree float *a = g_malloc (n * sizeof (float));
+-  g_autofree float *b = g_malloc (n * sizeof (float));
+-  gdouble best = -1.0, c;
+-  int best_dx = 0, best_dy = 0;
++  gdouble score;
++  double  angle;
++  int     dx, dy;
++} Hit;
+ 
+-  for (unsigned int i = 0; i < n; i++)
++/* best shift for one rotated probe: either the coarse grid over the whole
++ * search range, or every shift in a window around a previous hit */
++static void
++search_shifts (const gint8 *a, const gint8 *b, int w, int h, double angle,
++               int dx0, int dx1, int dy0, int dy1, int step_x, int step_y,
++               Hit *best)
++{
++  dx0 = MAX (dx0, -ELANPRESS_NCC_MAX_DX);
++  dx1 = MIN (dx1, ELANPRESS_NCC_MAX_DX);
++  dy0 = MAX (dy0, -ELANPRESS_NCC_MAX_DY);
++  dy1 = MIN (dy1, ELANPRESS_NCC_MAX_DY);
++
++  for (int dy = dy0; dy <= dy1; dy += step_y)
++    for (int dx = dx0; dx <= dx1; dx += step_x)
++      {
++        gdouble c = ncc_at (a, b, w, h, dx, dy);
++
++        if (c > best->score)
++          *best = (Hit) { c, angle, dx, dy };
++      }
++}
++
++/* Best masked NCC of probe a against stored image b over translations and
++ * rotations of a: a coarse grid of shifts at coarse angles, then the two best
++ * coarse hits are refined over every shift nearby at fine angle steps. */
++gdouble
++elanpress_ncc_best (const gint8 *a, const gint8 *b, int w, int h)
++{
++  g_autofree gint8 *rot = g_malloc (w * h);
++  Hit coarse[2] = { { -1.0, 0, 0, 0 }, { -1.0, 0, 0, 0 } };
++  Hit best = { -1.0, 0, 0, 0 };
++
++  for (double ang = -ELANPRESS_NCC_MAX_ANGLE; ang <= ELANPRESS_NCC_MAX_ANGLE + 1e-9;
++       ang += ELANPRESS_NCC_COARSE_ANGLE_STEP)
+     {
+-      a[i] = a8[i];
+-      b[i] = b8[i];
++      Hit hit = { -1.0, ang, 0, 0 };
++
++      rotate_image (a, rot, w, h, ang);
++      search_shifts (rot, b, w, h, ang,
++                     -ELANPRESS_NCC_MAX_DX, ELANPRESS_NCC_MAX_DX,
++                     -ELANPRESS_NCC_MAX_DY, ELANPRESS_NCC_MAX_DY, 3, 2, &hit);
++      if (hit.score > coarse[0].score)
++        {
++          coarse[1] = coarse[0];
++          coarse[0] = hit;
++        }
++      else if (hit.score > coarse[1].score)
++        {
++          coarse[1] = hit;
++        }
+     }
+ 
+-  for (int dy = -ELANPRESS_NCC_MAX_DY; dy <= ELANPRESS_NCC_MAX_DY; dy += 2)
+-    for (int dx = -ELANPRESS_NCC_MAX_DX; dx <= ELANPRESS_NCC_MAX_DX; dx += 3)
+-      {
+-        c = ncc_at (a, b, w, h, dx, dy);
+-        if (c > best)
+-          {
+-            best = c;
+-            best_dx = dx;
+-            best_dy = dy;
+-          }
+-      }
++  for (int k = 0; k < 2; k++)
++    {
++      if (coarse[k].score < -0.5)
++        continue;
++      for (double ang = coarse[k].angle - ELANPRESS_NCC_FINE_ANGLE_STEP;
++           ang <= coarse[k].angle + ELANPRESS_NCC_FINE_ANGLE_STEP + 1e-9;
++           ang += ELANPRESS_NCC_FINE_ANGLE_STEP)
++        {
++          if (fabs (ang) > ELANPRESS_NCC_MAX_ANGLE + 1e-9)
++            continue;
++          rotate_image (a, rot, w, h, ang);
++          search_shifts (rot, b, w, h, ang,
++                         coarse[k].dx - 4, coarse[k].dx + 4,
++                         coarse[k].dy - 3, coarse[k].dy + 3, 1, 1, &best);
++        }
++    }
+ 
+-  for (int dy = best_dy - 2; dy <= best_dy + 2; dy++)
+-    for (int dx = best_dx - 3; dx <= best_dx + 3; dx++)
+-      {
+-        c = ncc_at (a, b, w, h, dx, dy);
+-        if (c > best)
+-          best = c;
+-      }
+-
+-  return best;
++  return best.score;
+ }
+diff --git a/libfprint/drivers/elanpress-match.h b/libfprint/drivers/elanpress-match.h
+index f3321ddc..7c402f99 100644
+--- a/libfprint/drivers/elanpress-match.h
++++ b/libfprint/drivers/elanpress-match.h
+@@ -30,26 +30,50 @@
+ #define ELANPRESS_LN_SIGMA 4.0
+ #define ELANPRESS_IMG_SCALE 40.0
+ 
++/* Local contrast normalisation amplifies the sensor noise where the finger
++ * does not touch to the same strength as ridges. Such pixels are marked
++ * invalid (ELANPRESS_PX_INVALID, a value normal samples never take) and are
++ * left out of matching. A pixel is noise when more than this fraction of the
++ * local energy lies above the ridge band (ridges are ~8 px apart, noise is
++ * pixel-to-pixel). */
++#define ELANPRESS_PX_INVALID (-128)
++#define ELANPRESS_NOISE_SIGMA 1.0
++#define ELANPRESS_NOISE_WINDOW_SIGMA 4.0
++#define ELANPRESS_NOISE_MAX_FRACTION 0.35
++
+ /* A touch whose high-pass energy (RMS, in sensor counts) is below this had
+  * no usable ridge structure (barely touching, wet smear); ask for a retry. */
+ #define ELANPRESS_MIN_RIDGE_RMS 30.0
+ 
+-/* Matching: zero-mean normalised cross-correlation over translations,
+- * coarse grid then refinement around the best hit. */
+-#define ELANPRESS_NCC_THRESHOLD 0.60
++/* Matching: zero-mean normalised cross-correlation over the pixels valid in
++ * both images, searched over translations and small rotations of the probe.
++ * Any two fingers' ridges line up somewhere over a small overlap, so the
++ * overlap has to be large for a score to mean anything. */
++#define ELANPRESS_NCC_THRESHOLD 0.70
+ #define ELANPRESS_NCC_MAX_DX 60
+ #define ELANPRESS_NCC_MAX_DY 20
+-#define ELANPRESS_NCC_MIN_OVERLAP_PX 1500
++#define ELANPRESS_NCC_MIN_OVERLAP_PX 3500
++#define ELANPRESS_NCC_MAX_ANGLE 10.0
++#define ELANPRESS_NCC_COARSE_ANGLE_STEP 5.0
++#define ELANPRESS_NCC_FINE_ANGLE_STEP 2.5
+ 
+-/* During enrollment a touch this similar to one already stored adds no
+- * coverage; the user is asked to move the finger. */
+-#define ELANPRESS_DUP_THRESHOLD 0.75
++/* A touch with fewer valid pixels than a match needs to overlap cannot be
++ * matched or usefully enrolled; ask for a retry. */
++#define ELANPRESS_MIN_VALID_PX ELANPRESS_NCC_MIN_OVERLAP_PX
+ 
+ void    elanpress_rotate_frame (const guint8   *raw,
+                                 unsigned short *out,
+                                 int             w,
+                                 int             h);
+ 
++void    elanpress_mask_noise (gint8 *img,
++                              int    w,
++                              int    h);
++
++int     elanpress_count_valid (const gint8 *img,
++                               int          w,
++                               int          h);
++
+ gint8  *elanpress_process_frames (GSList               *frames,
+                                   int                   num_frames,
+                                   const unsigned short *background,
+diff --git a/libfprint/drivers/elanpress.c b/libfprint/drivers/elanpress.c
+index 1b662f54..3388c664 100644
+--- a/libfprint/drivers/elanpress.c
++++ b/libfprint/drivers/elanpress.c
+@@ -561,18 +561,21 @@ elanpress_enroll_touch_done (FpiSsm *ssm, FpDevice *dev, GError *error)
+       return;
+     }
+ 
+-  if (dup >= ELANPRESS_DUP_THRESHOLD)
++  if (elanpress_count_valid (image, self->frame_width, self->frame_height) <
++      ELANPRESS_MIN_VALID_PX)
+     {
+-      /* the sensor sees only a few square millimetres: a touch this close
+-       * to a stored one adds no coverage, make the user move the finger */
++      /* finger only covered a corner of the sensor */
+       g_free (image);
+       fpi_device_enroll_progress (dev, self->enroll_stage, NULL,
+-                                  fpi_device_retry_new_msg (FP_DEVICE_RETRY_CENTER_FINGER,
+-                                                            "Touch too similar to a previous one, move the finger to a different spot"));
++                                  fpi_device_retry_new (FP_DEVICE_RETRY_CENTER_FINGER));
+       elanpress_capture_touch (self, elanpress_enroll_touch_done);
+       return;
+     }
+ 
++  /* Touches similar to stored ones are kept on purpose: verification
++   * presses land where the finger naturally rests, so that area needs to be
++   * covered several times over rather than the edges of the fingertip. */
++
+   g_ptr_array_add (self->enroll_images, image);
+   self->enroll_stage++;
+   fpi_device_enroll_progress (dev, self->enroll_stage, NULL, NULL);
+@@ -630,7 +633,9 @@ elanpress_match_touch_done (FpiSsm *ssm, FpDevice *dev, GError *error)
+   elanpress_reset_capture (self);
+   fp_dbg ("probe touch: ridge rms %.0f", rms);
+ 
+-  if (!probe || rms < ELANPRESS_MIN_RIDGE_RMS)
++  if (!probe || rms < ELANPRESS_MIN_RIDGE_RMS ||
++      elanpress_count_valid (probe, self->frame_width, self->frame_height) <
++      ELANPRESS_MIN_VALID_PX)
+     {
+       GError *retry = fpi_device_retry_new (FP_DEVICE_RETRY_GENERAL);
+ 
+diff --git a/libfprint/drivers/elanpress.h b/libfprint/drivers/elanpress.h
+index 25349793..d008ceb1 100644
+--- a/libfprint/drivers/elanpress.h
++++ b/libfprint/drivers/elanpress.h
+@@ -62,11 +62,12 @@
+ #define ELANPRESS_MIN_FRAMES 3
+ #define ELANPRESS_MAX_FRAMES 10
+ 
+-/* number of touches stored during enrollment */
+-#define ELANPRESS_ENROLL_STAGES 16
++/* number of touches stored during enrollment; the sensor sees ~7.5x2.6 mm,
++ * so the stored touches must cover where the finger naturally lands */
++#define ELANPRESS_ENROLL_STAGES 20
+ 
+-/* version tag for the serialized print data */
+-#define ELANPRESS_PRINT_VERSION 2
++/* version tag for the serialized print data (3: noise-masked images) */
++#define ELANPRESS_PRINT_VERSION 3
+ 
+ G_DECLARE_FINAL_TYPE (FpiDeviceElanPress, fpi_device_elanpress, FPI,
+                       DEVICE_ELANPRESS, FpDevice);
+-- 
+2.56.0
+

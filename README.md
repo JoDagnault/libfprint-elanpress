@@ -17,13 +17,19 @@ driver has to do the matching itself.
 * `0002`: fixes for the Vivobook M7400QC. The sensor's finger query blocks
   instead of answering "no finger", which hung enrollment, and the matcher
   accepted other fingers. Matching now uses high-pass, contrast-normalised
-  images with a 0.60 threshold, and enrollment takes 16 touches.
+  images.
+* `0003`: matching that works in daily use. Regions without finger contact
+  are masked out, rotations up to 10 degrees are searched, matches need a
+  large overlap (threshold 0.70), and enrollment keeps 20 natural presses
+  instead of forcing the finger to the edges. Prints from `0002` are
+  rejected; enroll again after upgrading.
 
 ## Install
 
 ```sh
 makepkg -si
-sudo fprintd-enroll $USER   # 16 touches, move the finger between touches, do not swipe
+fprintd-delete $USER        # when upgrading from an older print format
+fprintd-enroll $USER        # 20 touches: press the way you do to unlock, lift in between, do not swipe
 fprintd-verify
 ```
 
@@ -34,7 +40,11 @@ it reinstalls stock libfprint.
 ## Notes
 
 * The sensor sees about 7.5 x 2.6 mm. A press only matches where it overlaps
-  an enrolled touch, so vary the position during enrollment.
+  an enrolled touch, so enroll the way you will actually press, with only the
+  small natural variation between touches.
+* For analysis, `ELANPRESS_DUMP_DIR` in fprintd's environment makes the
+  driver write every raw frame there; fprintd's sandbox must allow writing
+  to it (`ReadWritePaths=`).
 * Matching was validated on one person's fingers only. Keep the password as
   fallback.
 * To move to a new libfprint release: set `pkgver` and `_commit` in
